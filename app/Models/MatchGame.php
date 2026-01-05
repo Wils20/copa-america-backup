@@ -9,21 +9,16 @@ class MatchGame extends Model
 {
     use HasFactory;
 
-    // OPCIÓN RECOMENDADA: Usar $guarded = []
-    // Esto le dice a Laravel: "Deja guardar datos en CUALQUIER columna".
-    // Es mucho más fácil que estar escribiendo cada nombre en $fillable.
     protected $guarded = [];
 
-    // ¡ESTO ES LO MÁS IMPORTANTE!
-    // Convierte automáticamente el JSON de la base de datos a un Array PHP usable.
-    // Sin esto, el sistema falla al intentar leer las estadísticas.
+    // --- AGREGA ESTO ---
     protected $casts = [
-        'stats' => 'array',
+        'stats' => 'array',  // <--- ¡ESTO ES LA CLAVE MÁGICA!
+        'is_running' => 'boolean',
     ];
 
-    // Relación: Un partido tiene muchos eventos
     public function events()
     {
-        return $this->hasMany(\App\Models\MatchEvent::class)->orderBy('id', 'desc');
+        return $this->hasMany(MatchEvent::class);
     }
 }

@@ -9,12 +9,12 @@ use Illuminate\Support\Facades\Schema;
 
 /*
 |--------------------------------------------------------------------------
-| Web Routes - Sistema Mundial 2026 (FINAL FUSIONADO: STREAMING + BIG DATA + COPA AMÉRICA)
+| Web Routes - Sistema Mundial 2026 (FINAL BLINDADO)
 |--------------------------------------------------------------------------
 */
 
 // --------------------------------------------------------------------------
-// 1. VISTAS
+// 1. VISTAS (FRONTEND)
 // --------------------------------------------------------------------------
 
 Route::get('/', function () {
@@ -31,10 +31,15 @@ Route::get('/ver-partido/{id}', function ($id) {
     $timer = MatchTimer::where('match_game_id', $match->id)->first();
     $currentMinute = $timer ? $timer->current_minute : 0;
 
-    // Inicializar visualmente las stats si están vacías
-    if(!$match->stats) {
-        $match->stats = ['possession_home' => 50, 'possession_away' => 50, 'shots_home' => 0, 'shots_away' => 0, 'corners_home' => 0, 'corners_away' => 0, 'fouls_home' => 0, 'fouls_away' => 0, 'win_prob_home' => 33, 'win_prob_draw' => 34, 'win_prob_away' => 33];
+    // Decodificar stats para la vista
+    $stats = $match->stats;
+    if (is_string($stats)) $stats = json_decode($stats, true);
+
+    if(!$stats) {
+        $stats = ['possession_home' => 50, 'possession_away' => 50, 'shots_home' => 0, 'shots_away' => 0, 'corners_home' => 0, 'corners_away' => 0, 'fouls_home' => 0, 'fouls_away' => 0, 'win_prob_home' => 33, 'win_prob_draw' => 34, 'win_prob_away' => 33];
     }
+    // Asignamos de nuevo al objeto para que la vista lo lea fácil
+    $match->stats = $stats;
 
     return view('estadio', compact('match', 'history', 'currentMinute'));
 });
@@ -47,33 +52,56 @@ Route::get('/panel-control/{id}', function($id) {
 });
 
 // --------------------------------------------------------------------------
-// 2. API DEL ÁRBITRO (Lógica del Juego + Analytics)
+// 2. API DEL ÁRBITRO (LÓGICA BLINDADA ANTI-ERRORES)
 // --------------------------------------------------------------------------
 
 Route::get('/arbitro/{id}/{type}', function ($id, $type) {
 
-    $match = MatchGame::findOrFail($id);
-    $timer = MatchTimer::firstOrCreate(['match_game_id' => $match->id]);
+    // 1. INTENTO DE CARGAR BASE DE DATOS
+    try {
+        $match = MatchGame::findOrFail($id);
+        $timer = MatchTimer::firstOrCreate(['match_game_id' => $match->id]);
+    } catch (\Exception $e) {
+        return response()->json(['success' => false, 'error_msg' => 'Error BD: ' . $e->getMessage()], 500);
+    }
 
-    // Cargar Stats actuales o iniciar valores por defecto
-    $stats = $match->stats ?? [
-        'possession_home' => 50, 'possession_away' => 50,
-        'shots_home' => 0, 'shots_away' => 0,
-        'corners_home' => 0, 'corners_away' => 0,
-        'fouls_home' => 0, 'fouls_away' => 0,
-        'win_prob_home' => 33, 'win_prob_draw' => 34, 'win_prob_away' => 33
-    ];
+    // --- CORRECCIÓN ERROR "STRING ON STRING" ---
+    // Leemos stats de la BD
+    $rawStats = $match->stats;
 
-    // Jugadores
-    $homePlayersDB = Player::where('team_name', $match->team_home)->get();
-    $playersHome = $homePlayersDB->count() > 0 ? $homePlayersDB->pluck('name')->toArray() : ['Local #1'];
-    $awayPlayersDB = Player::where('team_name', $match->team_away)->get();
-    $playersAway = $awayPlayersDB->count() > 0 ? $awayPlayersDB->pluck('name')->toArray() : ['Visita #1'];
+    // Si viene como texto (JSON), lo convertimos a Array
+    if (is_string($rawStats)) {
+        $stats = json_decode($rawStats, true);
+    } else {
+        $stats = $rawStats;
+    }
+
+    // Si está vacío o corrupto, ponemos los defaults
+    if (!is_array($stats)) {
+        $stats = [
+            'possession_home' => 50, 'possession_away' => 50,
+            'shots_home' => 0, 'shots_away' => 0,
+            'corners_home' => 0, 'corners_away' => 0,
+            'fouls_home' => 0, 'fouls_away' => 0,
+            'win_prob_home' => 33, 'win_prob_draw' => 34, 'win_prob_away' => 33
+        ];
+    }
+    // -------------------------------------------
+
+    // Intentar Cargar Jugadores
+    $playersHome = ['Jugador Local'];
+    $playersAway = ['Jugador Visita'];
+    try {
+        $hp = Player::where('team_name', $match->team_home)->get();
+        if($hp->count() > 0) $playersHome = $hp->pluck('name')->toArray();
+        $ap = Player::where('team_name', $match->team_away)->get();
+        if($ap->count() > 0) $playersAway = $ap->pluck('name')->toArray();
+    } catch(\Exception $e) { /* Fallo silencioso */ }
 
     $minute = $timer->current_minute;
     $playerName = null;
     $msg = "Evento";
-    $shouldBroadcast = true; // Por defecto notificamos
+    $shouldBroadcast = true;
 
     switch ($type) {
         // --- CONTROL DE TIEMPO ---
@@ -103,54 +131,38 @@ Route::get('/arbitro/{id}/{type}', function ($id, $type) {
             $minute = 0;
             break;
 
-        // --- GOLES (Afectan posesión y victoria) ---
+        // --- GOLES ---
         case 'goal_home':
             $playerName = $playersHome[array_rand($playersHome)];
             $msg = "¡GOOOL DE " . $match->team_home . "!";
-            $stats['shots_home']++;
-            $stats['possession_home'] += 2;
+            $stats['shots_home']++; $stats['possession_home'] += 2;
             break;
         case 'goal_away':
             $playerName = $playersAway[array_rand($playersAway)];
             $msg = "¡GOOOL DE " . $match->team_away . "!";
-            $stats['shots_away']++;
-            $stats['possession_away'] += 2;
+            $stats['shots_away']++; $stats['possession_away'] += 2;
             break;
 
-        // --- EVENTOS ESTADÍSTICOS (Sin Toast, solo update numérico) ---
-        case 'shot_home':
-            $stats['shots_home']++; $stats['possession_home'] += 1;
-            $msg = "Remate Local"; $shouldBroadcast = false; break;
-        case 'shot_away':
-            $stats['shots_away']++; $stats['possession_away'] += 1;
-            $msg = "Remate Visita"; $shouldBroadcast = false; break;
-        case 'corner_home':
-            $stats['corners_home']++; $msg = "Córner Local"; break;
-        case 'corner_away':
-            $stats['corners_away']++; $msg = "Córner Visita"; break;
-        case 'foul_home':
-            $stats['fouls_home']++; $msg = "Falta Local"; $shouldBroadcast = false; break;
-        case 'foul_away':
-            $stats['fouls_away']++; $msg = "Falta Visita"; $shouldBroadcast = false; break;
+        // --- EVENTOS ESTADÍSTICOS ---
+        case 'shot_home': $stats['shots_home']++; $stats['possession_home'] += 1; $msg = "Remate Local"; $shouldBroadcast = false; break;
+        case 'shot_away': $stats['shots_away']++; $stats['possession_away'] += 1; $msg = "Remate Visita"; $shouldBroadcast = false; break;
+        case 'corner_home': $stats['corners_home']++; $msg = "Córner Local"; break;
+        case 'corner_away': $stats['corners_away']++; $msg = "Córner Visita"; break;
+        case 'foul_home': $stats['fouls_home']++; $msg = "Falta Local"; $shouldBroadcast = false; break;
+        case 'foul_away': $stats['fouls_away']++; $msg = "Falta Visita"; $shouldBroadcast = false; break;
 
         // --- TARJETAS Y CAMBIOS ---
         case 'yellow_card_home': $playerName = $playersHome[array_rand($playersHome)]; $msg = "Amarilla"; $stats['fouls_home']++; break;
         case 'yellow_card_away': $playerName = $playersAway[array_rand($playersAway)]; $msg = "Amarilla"; $stats['fouls_away']++; break;
         case 'red_card_home': $playerName = $playersHome[array_rand($playersHome)]; $msg = "Roja"; $stats['fouls_home']++; break;
         case 'red_card_away': $playerName = $playersAway[array_rand($playersAway)]; $msg = "Roja"; $stats['fouls_away']++; break;
-        case 'substitution_home':
-            $msg = "Cambio " . $match->team_home;
-            $playerName = "🔺 " . $playersHome[array_rand($playersHome)] . " | 🔻 " . $playersHome[array_rand($playersHome)];
-            break;
-        case 'substitution_away':
-            $msg = "Cambio " . $match->team_away;
-            $playerName = "🔺 " . $playersAway[array_rand($playersAway)] . " | 🔻 " . $playersAway[array_rand($playersAway)];
-            break;
+        case 'substitution_home': $msg = "Cambio " . $match->team_home; $playerName = "🔺 " . $playersHome[array_rand($playersHome)] . " | 🔻 " . $playersHome[array_rand($playersHome)]; break;
+        case 'substitution_away': $msg = "Cambio " . $match->team_away; $playerName = "🔺 " . $playersAway[array_rand($playersAway)] . " | 🔻 " . $playersAway[array_rand($playersAway)]; break;
     }
 
     // --- ALGORITMO IA: PROBABILIDAD DE VICTORIA ---
     $diff = $match->score_home - $match->score_away;
-    $factor = ($minute / 90) * 1.5; // El tiempo influye más al final
+    $factor = ($minute / 90) * 1.5;
 
     if ($diff > 0) { // Gana Local
         $stats['win_prob_home'] = min(99, 50 + ($diff * 15) + ($factor * 20));
@@ -174,7 +186,7 @@ Route::get('/arbitro/{id}/{type}', function ($id, $type) {
         $stats['possession_away'] = 100 - $stats['possession_home'];
     }
 
-    // Guardar Stats
+    // Guardar Stats (Laravel se encargará de convertirlo a JSON al guardar)
     $match->stats = $stats;
     $match->save();
 
@@ -182,21 +194,31 @@ Route::get('/arbitro/{id}/{type}', function ($id, $type) {
         $match->update(['start_time' => "VIVO " . intval($timer->current_minute) . "'"]);
     }
 
-    // Enviar Evento WebSocket
-    if($shouldBroadcast && !in_array($type, ['shot_home', 'shot_away', 'foul_home', 'foul_away'])) {
-        GameUpdate::dispatch($match, $type, $msg, $minute, $playerName);
-    } else {
-        GameUpdate::dispatch($match, 'stats_update', 'Stats Update', $minute, null);
+    // 2. INTENTO DE TRANSMISIÓN (REVERB) - CON PROTECCIÓN DE ERRORES
+    $broadcastError = null;
+    try {
+        if($shouldBroadcast && !in_array($type, ['shot_home', 'shot_away', 'foul_home', 'foul_away'])) {
+            GameUpdate::dispatch($match, $type, $msg, $minute, $playerName);
+        } else {
+            GameUpdate::dispatch($match, 'stats_update', 'Stats Update', $minute, null);
+        }
+    } catch (\Exception $e) {
+        $broadcastError = $e->getMessage();
     }
 
-    return response()->json(['success' => true, 'stats' => $stats]);
+    // 3. RESPUESTA FINAL
+    return response()->json([
+        'success' => true,
+        'stats' => $stats,
+        'message' => $msg,
+        'broadcast_status' => $broadcastError ? 'ERROR: ' . $broadcastError : 'OK'
+    ]);
 });
 
 // --------------------------------------------------------------------------
-// 3. UTILS & SETUP
+// 3. UTILS & SETUP (INSTALADORES)
 // --------------------------------------------------------------------------
 
-// INSTALADOR DE STATS (EJECUTAR UNA VEZ)
 Route::get('/instalar-stats', function() {
     if (!Schema::hasColumn('match_games', 'stats')) {
         Schema::table('match_games', function ($table) { $table->json('stats')->nullable(); });
@@ -208,7 +230,7 @@ Route::get('/instalar-stats', function() {
 Route::get('/setup-rapido', function() {
     if(MatchGame::count() > 0) return "Ya existen partidos.";
 
-    // Stats iniciales
+    // Stats iniciales (Como array encodeado, por si acaso)
     $initStats = json_encode(['possession_home' => 50, 'possession_away' => 50, 'shots_home' => 0, 'shots_away' => 0, 'corners_home' => 0, 'corners_away' => 0, 'fouls_home' => 0, 'fouls_away' => 0, 'win_prob_home' => 33, 'win_prob_draw' => 34, 'win_prob_away' => 33]);
 
     // COPA AMÉRICA
